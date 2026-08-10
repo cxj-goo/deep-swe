@@ -1,7 +1,10 @@
-name: Bundle Task Images Only (Manual)
+name: Bundle Task Images Deduplicated (Manual)
 
 on:
   workflow_dispatch: {}
+
+env:
+  WORKDIR: /mnt/work
 
 jobs:
   bundle:
@@ -11,6 +14,28 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ========== 磁盘空间优化 ==========
+      - name: Maximize disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          sudo docker system prune -af --volumes
+          df -h
+
+      - name: Move Docker data to /mnt
+        run: |
+          sudo systemctl stop docker
+          sudo mv /var/lib/docker /mnt/docker
+          sudo ln -s /mnt/docker /var/lib/docker
+          sudo systemctl start docker
+          echo "Docker data root: $(docker info --format '{{.DockerRootDir}}')"
+
+      - name: Set workspace to /mnt
+        run: |
+          sudo mkdir -p ${{ env.WORKDIR }}
+          sudo chmod 777 ${{ env.WORKDIR }}
+          echo "WORKDIR=${{ env.WORKDIR }}" >> $GITHUB_ENV
+
+      # ========== 解析镜像列表 ==========
       - name: Install Python 3 from system package
         run: |
           sudo apt-get update
@@ -18,7 +43,7 @@ jobs:
 
       - name: Write task.toml parser script
         run: |
-          cat > "$GITHUB_WORKSPACE/parse_images.py" << 'EOF'
+          cat > "${{ env.WORKDIR }}/parse_images.py" << 'EOF'
           import pathlib
 
           try:
@@ -52,49 +77,68 @@ jobs:
           EOF
 
       - name: Parse all task.toml docker_image fields
-        run: python3 "$GITHUB_WORKSPACE/parse_images.py"
+        working-directory: ${{ env.WORKDIR }}
+        run: python3 parse_images.py
 
-      - name: Pull every task image and save individually with progress
+      # ========== 拉取并合并打包 ==========
+      - name: Pull every task image with progress, then save all to single deduplicated tar
+        working-directory: ${{ env.WORKDIR }}
         run: |
           set -euo pipefail
           mapfile -t IMAGES < images.txt
           TOTAL=${#IMAGES[@]}
           COUNT=0
-          mkdir -p image_tars
           : > failed_images.txt
 
+          # Phase 1: Pull each image individually with progress
           for image in "${IMAGES[@]}"; do
             [ -z "$image" ] && continue
             COUNT=$((COUNT + 1))
-            SAFE_NAME=$(echo "$image" | tr '/:' '_')
             echo "=== [$COUNT / $TOTAL] Pulling $image ==="
-            if docker pull "$image"; then
-              echo "=== [$COUNT / $TOTAL] Saving $image -> image_tars/${SAFE_NAME}.tar ==="
-              docker save "$image" -o "image_tars/${SAFE_NAME}.tar"
-            else
+            if ! docker pull "$image"; then
               echo "!!! FAILED: $image"
               echo "$image" >> failed_images.txt
             fi
           done
 
           echo ""
-          echo "=== All operations complete: $COUNT / $TOTAL ==="
+          echo "=== Pull phase complete: $COUNT / $TOTAL ==="
+
+          # Phase 2: Save all successfully pulled images into ONE tar (shared layers deduplicated)
+          SUCCESSFUL_IMAGES=()
+          while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+            if ! grep -qxF "$line" failed_images.txt 2>/dev/null; then
+              SUCCESSFUL_IMAGES+=("$line")
+            fi
+          done < images.txt
+
+          OUTPUT_TAR="task-images-bundle.tar"
+
+          if [ ${#SUCCESSFUL_IMAGES[@]} -gt 0 ]; then
+            echo "=== Saving ${#SUCCESSFUL_IMAGES[@]} images to ${OUTPUT_TAR} (shared layers deduplicated) ==="
+            docker save "${SUCCESSFUL_IMAGES[@]}" -o "${OUTPUT_TAR}"
+            ls -lh "${OUTPUT_TAR}"
+            echo "=== Save complete ==="
+          else
+            echo "!!! No images were successfully pulled, skipping save."
+            exit 1
+          fi
+
           if [ -s failed_images.txt ]; then
+            echo ""
             echo "Failed images:"
             cat failed_images.txt
           fi
 
-      - name: Assemble final bundle tar
-        run: |
-          tar -cf task-images-bundle.tar \
-            -C image_tars . \
-            --transform='s|^\./||' \
-            2>/dev/null || \
-          tar -cf task-images-bundle.tar -C image_tars .
+          echo ""
+          echo "=== Final disk usage ==="
+          df -h /mnt
 
+      # ========== 上传产物 ==========
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: task-images-bundle
-          path: task-images-bundle.tar
+          path: ${{ env.WORKDIR }}/task-images-bundle.tar
           retention-days: 7
