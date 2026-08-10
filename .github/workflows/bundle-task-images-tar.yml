@@ -1,0 +1,100 @@
+name: Bundle Task Images Only (Manual)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Python 3 from system package
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3
+
+      - name: Write task.toml parser script
+        run: |
+          cat > "$GITHUB_WORKSPACE/parse_images.py" << 'EOF'
+          import pathlib
+
+          try:
+              import tomllib
+          except ModuleNotFoundError:
+              import tomli as tomllib
+
+          tasks_dir = pathlib.Path("tasks")
+          task_tomls = sorted(tasks_dir.glob("*/task.toml"))
+
+          images = []
+          missing = []
+          for t in task_tomls:
+              with open(t, "rb") as f:
+                  data = tomllib.load(f)
+              image = data.get("environment", {}).get("docker_image")
+              if image:
+                  images.append(image)
+              else:
+                  missing.append(str(t))
+
+          unique_images = sorted(set(images))
+          pathlib.Path("images.txt").write_text("\n".join(unique_images) + "\n")
+
+          print(f"task.toml files found: {len(task_tomls)}")
+          print(f"unique docker_image values: {len(unique_images)}")
+          if missing:
+              print("WARNING: no docker_image in:")
+              for m in missing:
+                  print(f"  - {m}")
+          EOF
+
+      - name: Parse all task.toml docker_image fields
+        run: python3 "$GITHUB_WORKSPACE/parse_images.py"
+
+      - name: Pull every task image and save individually with progress
+        run: |
+          set -euo pipefail
+          mapfile -t IMAGES < images.txt
+          TOTAL=${#IMAGES[@]}
+          COUNT=0
+          mkdir -p image_tars
+          : > failed_images.txt
+
+          for image in "${IMAGES[@]}"; do
+            [ -z "$image" ] && continue
+            COUNT=$((COUNT + 1))
+            SAFE_NAME=$(echo "$image" | tr '/:' '_')
+            echo "=== [$COUNT / $TOTAL] Pulling $image ==="
+            if docker pull "$image"; then
+              echo "=== [$COUNT / $TOTAL] Saving $image -> image_tars/${SAFE_NAME}.tar ==="
+              docker save "$image" -o "image_tars/${SAFE_NAME}.tar"
+            else
+              echo "!!! FAILED: $image"
+              echo "$image" >> failed_images.txt
+            fi
+          done
+
+          echo ""
+          echo "=== All operations complete: $COUNT / $TOTAL ==="
+          if [ -s failed_images.txt ]; then
+            echo "Failed images:"
+            cat failed_images.txt
+          fi
+
+      - name: Assemble final bundle tar
+        run: |
+          tar -cf task-images-bundle.tar \
+            -C image_tars . \
+            --transform='s|^\./||' \
+            2>/dev/null || \
+          tar -cf task-images-bundle.tar -C image_tars .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: task-images-bundle
+          path: task-images-bundle.tar
+          retention-days: 7
