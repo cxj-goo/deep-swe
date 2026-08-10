@@ -1,136 +1,135 @@
-# .github/workflows/bundle-task-images.yml  
-name: Bundle Task Images (Manual)  
-  
-on:  
-  workflow_dispatch: {}  
-  
-jobs:  
-  bundle:  
-    runs-on: ubuntu-latest  
-    timeout-minutes: 360  
-    steps:  
-      - name: Checkout repository  
-        uses: actions/checkout@v4  
-  
-      - name: Pull ubuntu:20.04 image  
-        run: docker pull ubuntu:20.04  
-  
-      - name: Start ubuntu:20.04 container (with repo mounted + docker socket)  
-        run: |  
-          docker run -d --name bundle-runner \  
-            -v /var/run/docker.sock:/var/run/docker.sock \  
-            -v "$GITHUB_WORKSPACE":/workspace \  
-            -w /workspace \  
-            ubuntu:20.04 \  
-            sleep infinity  
-  
-      - name: Install base tooling inside the container  
-        run: |  
-          docker exec bundle-runner bash -c '  
-            set -euo pipefail  
-            export DEBIAN_FRONTEND=noninteractive  
-            apt-get update  
-            apt-get install -y --no-install-recommends \  
-              ca-certificates curl gnupg lsb-release \  
-              build-essential zlib1g-dev libssl-dev libffi-dev \  
-              libbz2-dev libreadline-dev libsqlite3-dev liblzma-dev \  
-              tk-dev docker.io  
-          '  
-  
-      - name: Install Python 3.14.5 from source inside the container  
-        run: |  
-          docker exec bundle-runner bash -c '  
-            set -euo pipefail  
-            cd /usr/src  
-            curl -fsSL -o Python-3.14.5.tgz https://www.python.org/ftp/python/3.14.5/Python-3.14.5.tgz  
-            tar -xzf Python-3.14.5.tgz  
-            cd Python-3.14.5  
-            ./configure --enable-optimizations  
-            make -j"$(nproc)"  
-            make altinstall  
-            ln -sf /usr/local/bin/python3.14 /usr/local/bin/python3  
-            python3 --version  
-          '  
-  
-      - name: Write task.toml parser script  
-        run: |  
-          cat > "$GITHUB_WORKSPACE/parse_images.py" << 'EOF'  
-          import pathlib, tomllib  
-  
-          tasks_dir = pathlib.Path("/workspace/tasks")  
-          task_tomls = sorted(tasks_dir.glob("*/task.toml"))  
-  
-          images = []  
-          missing = []  
-          for t in task_tomls:  
-              with open(t, "rb") as f:  
-                  data = tomllib.load(f)  
-              image = data.get("environment", {}).get("docker_image")  
-              if image:  
-                  images.append(image)  
-              else:  
-                  missing.append(str(t))  
-  
-          unique_images = sorted(set(images))  
-          pathlib.Path("/workspace/images.txt").write_text("\n".join(unique_images) + "\n")  
-  
-          print(f"task.toml files found: {len(task_tomls)}")  
-          print(f"unique docker_image values: {len(unique_images)}")  
-          if missing:  
-              print("WARNING: no docker_image in:")  
-              for m in missing:  
-                  print(f"  - {m}")  
-          EOF  
-  
-      - name: Parse all task.toml docker_image fields  
-        run: docker exec bundle-runner python3 /workspace/parse_images.py  
-  
-      - name: Pull every task image  
-        run: |  
-          docker exec bundle-runner bash -c '  
-            set -euo pipefail  
-            : > /workspace/failed_images.txt  
-            while IFS= read -r image; do  
-              [ -z "$image" ] && continue  
-              echo "Pulling $image"  
-              if ! docker pull "$image"; then  
-                echo "$image" >> /workspace/failed_images.txt  
-              fi  
-            done < /workspace/images.txt  
-  
-            if [ -s /workspace/failed_images.txt ]; then  
-              echo "Some images failed to pull:"  
-              cat /workspace/failed_images.txt  
-            fi  
-          '  
-  
-      - name: Save all pulled images to a single tar  
-        run: |  
-          docker exec bundle-runner bash -c '  
-            set -euo pipefail  
-            mapfile -t IMAGES < /workspace/images.txt  
-            docker save "${IMAGES[@]}" -o /workspace/docker_images.tar  
-          '  
-  
-      - name: Export ubuntu:20.04 container filesystem (OS + Python + repo source)  
-        run: docker export bundle-runner -o container_rootfs.tar  
-  
-      - name: Assemble final bundle tar  
-        run: |  
-          mkdir -p bundle  
-          mv container_rootfs.tar bundle/  
-          mv docker_images.tar bundle/  
-          mv images.txt bundle/  
-          [ -s failed_images.txt ] && mv failed_images.txt bundle/ || true  
-          tar -cf deep-swe-bundle.tar -C bundle .  
-  
-      - name: Stop and remove container  
-        if: always()  
-        run: docker rm -f bundle-runner || true  
-  
-      - name: Upload artifact  
-        uses: actions/upload-artifact@v4  
-        with:  
-          name: deep-swe-bundle  
-          path: deep-swe-bundle.tar  
+name: Bundle Task Images (Manual)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Pull ubuntu:20.04 image
+        run: docker pull ubuntu:20.04
+
+      - name: Start ubuntu:20.04 container (with repo mounted + docker socket)
+        run: |
+          docker run -d --name bundle-runner \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace \
+            ubuntu:20.04 \
+            sleep infinity
+
+      - name: Install base tooling inside the container
+        run: |
+          docker exec bundle-runner bash -c '
+            set -euo pipefail
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              ca-certificates curl gnupg lsb-release \
+              build-essential zlib1g-dev libssl-dev libffi-dev \
+              libbz2-dev libreadline-dev libsqlite3-dev liblzma-dev \
+              tk-dev docker.io
+          '
+
+      - name: Install Python 3.14.5 from source inside the container
+        run: |
+          docker exec bundle-runner bash -c '
+            set -euo pipefail
+            cd /usr/src
+            curl -fsSL -o Python-3.14.5.tgz https://www.python.org/ftp/python/3.14.5/Python-3.14.5.tgz
+            tar -xzf Python-3.14.5.tgz
+            cd Python-3.14.5
+            ./configure --enable-optimizations
+            make -j"$(nproc)"
+            make altinstall
+            ln -sf /usr/local/bin/python3.14 /usr/local/bin/python3
+            python3 --version
+          '
+
+      - name: Write task.toml parser script
+        run: |
+          cat > "$GITHUB_WORKSPACE/parse_images.py" << 'EOF'
+          import pathlib, tomllib
+
+          tasks_dir = pathlib.Path("/workspace/tasks")
+          task_tomls = sorted(tasks_dir.glob("*/task.toml"))
+
+          images = []
+          missing = []
+          for t in task_tomls:
+              with open(t, "rb") as f:
+                  data = tomllib.load(f)
+              image = data.get("environment", {}).get("docker_image")
+              if image:
+                  images.append(image)
+              else:
+                  missing.append(str(t))
+
+          unique_images = sorted(set(images))
+          pathlib.Path("/workspace/images.txt").write_text("\n".join(unique_images) + "\n")
+
+          print(f"task.toml files found: {len(task_tomls)}")
+          print(f"unique docker_image values: {len(unique_images)}")
+          if missing:
+              print("WARNING: no docker_image in:")
+              for m in missing:
+                  print(f"  - {m}")
+          EOF
+
+      - name: Parse all task.toml docker_image fields
+        run: docker exec bundle-runner python3 /workspace/parse_images.py
+
+      - name: Pull every task image
+        run: |
+          docker exec bundle-runner bash -c '
+            set -euo pipefail
+            : > /workspace/failed_images.txt
+            while IFS= read -r image; do
+              [ -z "$image" ] && continue
+              echo "Pulling $image"
+              if ! docker pull "$image"; then
+                echo "$image" >> /workspace/failed_images.txt
+              fi
+            done < /workspace/images.txt
+
+            if [ -s /workspace/failed_images.txt ]; then
+              echo "Some images failed to pull:"
+              cat /workspace/failed_images.txt
+            fi
+          '
+
+      - name: Save all pulled images to a single tar
+        run: |
+          docker exec bundle-runner bash -c '
+            set -euo pipefail
+            mapfile -t IMAGES < /workspace/images.txt
+            docker save "${IMAGES[@]}" -o /workspace/docker_images.tar
+          '
+
+      - name: Export ubuntu:20.04 container filesystem (OS + Python + repo source)
+        run: docker export bundle-runner -o container_rootfs.tar
+
+      - name: Assemble final bundle tar
+        run: |
+          mkdir -p bundle
+          mv container_rootfs.tar bundle/
+          mv docker_images.tar bundle/
+          mv images.txt bundle/
+          [ -s failed_images.txt ] && mv failed_images.txt bundle/ || true
+          tar -cf deep-swe-bundle.tar -C bundle .
+
+      - name: Stop and remove container
+        if: always()
+        run: docker rm -f bundle-runner || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deep-swe-bundle
+          path: deep-swe-bundle.tar
           retention-days: 7
