@@ -1,16 +1,16 @@
-name: Bundle Task Images Deduplicated (Manual)-part0
+name: Bundle Task Images Deduplicated (Manual)
 
 on:
   workflow_dispatch:
     inputs:
       skip:
-        description: '跳跃个数（从排序后第 skip+1 个开始）'
+        description: "跳跃个数（从排序后第 skip+1 个开始）"
         required: true
-        default: '0'
+        default: "0"
       limit:
-        description: '打包镜像个数（0 = 全部剩余）'
+        description: "打包镜像个数（0 = 全部剩余）"
         required: true
-        default: '55'
+        default: "55"
 
 env:
   WORKDIR: /mnt/work
@@ -23,7 +23,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ========== 磁盘空间优化 ==========
       - name: Maximize disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
@@ -52,7 +51,6 @@ jobs:
           fi
           cp -r "${{ github.workspace }}/tasks" "${{ env.WORKDIR }}/tasks"
 
-      # ========== 解析 + 确定性排序 + 分页 ==========
       - name: Install Python 3
         run: |
           sudo apt-get update
@@ -82,51 +80,58 @@ jobs:
               if img:
                   images.append(img.strip())
 
-          # ✅ 确定性排序 + 去重
           unique = sorted(set(images))
           total = len(unique)
 
-          # ✅ 分页切片
           batch = unique[SKIP:]
           if LIMIT > 0:
               batch = batch[:LIMIT]
 
-          pathlib.Path("images.txt").write_text(" ".join(batch) + " ")
+          with open("images.txt", "w") as f:
+              for img in batch:
+                  f.write(img + "\n")
 
           print(f"Total unique: {total} | Skip: {SKIP} | Limit: {LIMIT} | Batch: {len(batch)}")
           for i, img in enumerate(batch):
-              print(f" [{SKIP+i}] {img}")
+              print(f"  [{SKIP+i}] {img}")
           PYEOF
 
           python3 parse_images.py
           echo "=== images.txt ($(wc -l < images.txt) lines) ==="
           cat images.txt
 
-      # ========== 拉取 + 单次 docker save 去重打包 ==========
       - name: Pull and save deduplicated bundle
         working-directory: ${{ env.WORKDIR }}
         run: |
           set -euo pipefail
-          mapfile -t IMAGES < images.txt
+
+          IMAGES=()
+          while IFS= read -r line; do
+            line="${line%%$'\r'}"
+            [[ -z "$line" ]] && continue
+            IMAGES+=("$line")
+          done < images.txt
           TOTAL=${#IMAGES[@]}
 
-          if [ "$TOTAL" -eq 0 ] || { [ "$TOTAL" -eq 1 ] && [ -z "${IMAGES[0]}" ]; }; then
+          if [ "$TOTAL" -eq 0 ]; then
             echo "!!! No images to process"; exit 1
           fi
 
           : > failed_images.txt
           COUNT=0
           for image in "${IMAGES[@]}"; do
-            [ -z "$image" ] && continue
             COUNT=$((COUNT + 1))
             echo "=== [$COUNT/$TOTAL] Pulling $image ==="
             docker pull "$image" || echo "$image" >> failed_images.txt
           done
 
-          # 过滤失败镜像
+          echo ""
+          echo "=== Pull complete: $COUNT attempted ==="
+
           SUCCESSFUL=()
           while IFS= read -r line; do
-            [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+            line="${line%%$'\r'}"
+            [[ -z "$line" ]] && continue
             grep -qxF "$line" failed_images.txt 2>/dev/null || SUCCESSFUL+=("$line")
           done < images.txt
 
@@ -138,16 +143,19 @@ jobs:
           LIMIT=${{ github.event.inputs.limit }}
           TAR="task-images-skip${SKIP}-limit${LIMIT}.tar"
 
-          # ✅ 关键：所有镜像作为参数一次性传入 docker save
-          # Docker 内部按 layer digest 去重，相同层只写入一次
-          echo "=== Saving ${#SUCCESSFUL[@]} images → $TAR (deduplicated) ==="
+          echo "=== Saving ${#SUCCESSFUL[@]} images to $TAR (deduplicated) ==="
           docker save "${SUCCESSFUL[@]}" -o "$TAR"
           ls -lh "$TAR"
 
-          [ -s failed_images.txt ] && { echo "Failed:"; cat failed_images.txt; }
+          if [ -s failed_images.txt ]; then
+            echo ""
+            echo "Failed images:"
+            cat failed_images.txt
+          fi
+
+          echo ""
           df -h /mnt
 
-      # ========== 上传 ==========
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
