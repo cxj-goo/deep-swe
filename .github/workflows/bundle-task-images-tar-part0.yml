@@ -56,7 +56,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3
 
-      # ✅ 关键修复：Python 只负责输出到 stdout，shell 负责写入文件
       - name: Parse, sort and slice image list
         working-directory: ${{ env.WORKDIR }}
         env:
@@ -69,10 +68,8 @@ jobs:
               import tomllib
           except ModuleNotFoundError:
               import tomli as tomllib
-
           SKIP = int(os.environ['SKIP'])
           LIMIT = int(os.environ['LIMIT'])
-
           tasks_dir = pathlib.Path('tasks')
           images = []
           for t in sorted(tasks_dir.glob('*/task.toml')):
@@ -80,49 +77,37 @@ jobs:
                   img = tomllib.load(f).get('environment', {}).get('docker_image')
               if img:
                   images.append(img.strip())
-
           unique = sorted(set(images))
           total = len(unique)
-
           batch = unique[SKIP:]
           if LIMIT > 0:
               batch = batch[:LIMIT]
-
-          # 只输出到 stdout，每行一个镜像
           for img in batch:
               print(img)
-
-          # 诊断信息输出到 stderr
-          print(f'Total unique: {total} | Skip: {SKIP} | Limit: {LIMIT} | Batch: {len(batch)}', file=sys.stderr)
+          print(f'Total: {total} | Skip: {SKIP} | Limit: {LIMIT} | Batch: {len(batch)}', file=sys.stderr)
           " > images.txt
 
-          echo "=== images.txt line count: $(wc -l < images.txt) ==="
-          echo "=== First 5 lines ==="
-          head -5 images.txt
-          echo "=== Last 5 lines ==="
-          tail -5 images.txt
-          echo "=== Hex dump of first 200 bytes ==="
-          xxd images.txt | head -15
+          echo "=== images.txt: $(wc -l < images.txt) lines ==="
+          head -3 images.txt
+          echo "..."
+          tail -3 images.txt
 
-      # ✅ 拉取前强制验证文件格式
       - name: Validate images.txt format
         working-directory: ${{ env.WORKDIR }}
         run: |
           LINE_COUNT=$(wc -l < images.txt)
           FIRST_LINE=$(head -1 images.txt)
-          echo "Lines: $LINE_COUNT"
-          echo "First line: [$FIRST_LINE]"
-          echo "First line length: ${#FIRST_LINE}"
-
-          # 如果只有1行且长度超过200，说明所有镜像挤在一行了
+          echo "Lines: $LINE_COUNT | First line length: ${#FIRST_LINE}"
           if [ "$LINE_COUNT" -le 1 ] && [ "${#FIRST_LINE}" -gt 200 ]; then
-            echo "!!! FATAL: images.txt has all images on one line!"
-            echo "!!! This means the Python script did not output newlines correctly."
-            exit 1
+            echo "!!! FATAL: all images on one line"; exit 1
           fi
 
+      # ✅ 关键修复：skip/limit 通过 env 传入，不在 shell 中内联展开 ${{ }}
       - name: Pull and save deduplicated bundle
         working-directory: ${{ env.WORKDIR }}
+        env:
+          INPUT_SKIP: ${{ github.event.inputs.skip }}
+          INPUT_LIMIT: ${{ github.event.inputs.limit }}
         run: |
           set -euo pipefail
 
@@ -135,7 +120,8 @@ jobs:
           TOTAL=${#IMAGES[@]}
 
           if [ "$TOTAL" -eq 0 ]; then
-            echo "!!! No images to process"; exit 1
+            echo "!!! No images to process"
+            exit 1
           fi
 
           echo "=== Will pull $TOTAL images ==="
@@ -159,4 +145,28 @@ jobs:
           done < images.txt
 
           if [ ${#SUCCESSFUL[@]} -eq 0 ]; then
-            echo "!!! All pulls failed";
+            echo "!!! All pulls failed"
+            exit 1
+          fi
+
+          TAR="task-images-skip${INPUT_SKIP}-limit${INPUT_LIMIT}.tar"
+
+          echo "=== Saving ${#SUCCESSFUL[@]} images to $TAR (deduplicated) ==="
+          docker save "${SUCCESSFUL[@]}" -o "$TAR"
+          ls -lh "$TAR"
+
+          if [ -s failed_images.txt ]; then
+            echo ""
+            echo "Failed images:"
+            cat failed_images.txt
+          fi
+
+          echo ""
+          df -h /mnt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: task-images-skip${{ github.event.inputs.skip }}-limit${{ github.event.inputs.limit }}
+          path: ${{ env.WORKDIR }}/task-images-skip${{ github.event.inputs.skip }}-limit${{ github.event.inputs.limit }}.tar
+          retention-days: 7
