@@ -56,27 +56,28 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3
 
+      # ✅ 关键修复：Python 只负责输出到 stdout，shell 负责写入文件
       - name: Parse, sort and slice image list
         working-directory: ${{ env.WORKDIR }}
         env:
           SKIP: ${{ github.event.inputs.skip }}
           LIMIT: ${{ github.event.inputs.limit }}
         run: |
-          cat > parse_images.py << 'PYEOF'
-          import pathlib, os
+          python3 -c "
+          import pathlib, os, sys
           try:
               import tomllib
           except ModuleNotFoundError:
               import tomli as tomllib
 
-          SKIP = int(os.environ["SKIP"])
-          LIMIT = int(os.environ["LIMIT"])
+          SKIP = int(os.environ['SKIP'])
+          LIMIT = int(os.environ['LIMIT'])
 
-          tasks_dir = pathlib.Path("tasks")
+          tasks_dir = pathlib.Path('tasks')
           images = []
-          for t in sorted(tasks_dir.glob("*/task.toml")):
-              with open(t, "rb") as f:
-                  img = tomllib.load(f).get("environment", {}).get("docker_image")
+          for t in sorted(tasks_dir.glob('*/task.toml')):
+              with open(t, 'rb') as f:
+                  img = tomllib.load(f).get('environment', {}).get('docker_image')
               if img:
                   images.append(img.strip())
 
@@ -87,18 +88,38 @@ jobs:
           if LIMIT > 0:
               batch = batch[:LIMIT]
 
-          with open("images.txt", "w") as f:
-              for img in batch:
-                  f.write(img + "\n")
+          # 只输出到 stdout，每行一个镜像
+          for img in batch:
+              print(img)
 
-          print(f"Total unique: {total} | Skip: {SKIP} | Limit: {LIMIT} | Batch: {len(batch)}")
-          for i, img in enumerate(batch):
-              print(f"  [{SKIP+i}] {img}")
-          PYEOF
+          # 诊断信息输出到 stderr
+          print(f'Total unique: {total} | Skip: {SKIP} | Limit: {LIMIT} | Batch: {len(batch)}', file=sys.stderr)
+          " > images.txt
 
-          python3 parse_images.py
-          echo "=== images.txt ($(wc -l < images.txt) lines) ==="
-          cat images.txt
+          echo "=== images.txt line count: $(wc -l < images.txt) ==="
+          echo "=== First 5 lines ==="
+          head -5 images.txt
+          echo "=== Last 5 lines ==="
+          tail -5 images.txt
+          echo "=== Hex dump of first 200 bytes ==="
+          xxd images.txt | head -15
+
+      # ✅ 拉取前强制验证文件格式
+      - name: Validate images.txt format
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          LINE_COUNT=$(wc -l < images.txt)
+          FIRST_LINE=$(head -1 images.txt)
+          echo "Lines: $LINE_COUNT"
+          echo "First line: [$FIRST_LINE]"
+          echo "First line length: ${#FIRST_LINE}"
+
+          # 如果只有1行且长度超过200，说明所有镜像挤在一行了
+          if [ "$LINE_COUNT" -le 1 ] && [ "${#FIRST_LINE}" -gt 200 ]; then
+            echo "!!! FATAL: images.txt has all images on one line!"
+            echo "!!! This means the Python script did not output newlines correctly."
+            exit 1
+          fi
 
       - name: Pull and save deduplicated bundle
         working-directory: ${{ env.WORKDIR }}
@@ -116,6 +137,8 @@ jobs:
           if [ "$TOTAL" -eq 0 ]; then
             echo "!!! No images to process"; exit 1
           fi
+
+          echo "=== Will pull $TOTAL images ==="
 
           : > failed_images.txt
           COUNT=0
@@ -136,29 +159,4 @@ jobs:
           done < images.txt
 
           if [ ${#SUCCESSFUL[@]} -eq 0 ]; then
-            echo "!!! All pulls failed"; exit 1
-          fi
-
-          SKIP=${{ github.event.inputs.skip }}
-          LIMIT=${{ github.event.inputs.limit }}
-          TAR="task-images-skip${SKIP}-limit${LIMIT}.tar"
-
-          echo "=== Saving ${#SUCCESSFUL[@]} images to $TAR (deduplicated) ==="
-          docker save "${SUCCESSFUL[@]}" -o "$TAR"
-          ls -lh "$TAR"
-
-          if [ -s failed_images.txt ]; then
-            echo ""
-            echo "Failed images:"
-            cat failed_images.txt
-          fi
-
-          echo ""
-          df -h /mnt
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: task-images-skip${{ github.event.inputs.skip }}-limit${{ github.event.inputs.limit }}
-          path: ${{ env.WORKDIR }}/task-images-skip${{ github.event.inputs.skip }}-limit${{ github.event.inputs.limit }}.tar
-          retention-days: 7
+            echo "!!! All pulls failed";
